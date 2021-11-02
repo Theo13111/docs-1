@@ -1,0 +1,147 @@
+import random, secrets, json, re, pathlib, getpass, tensorflow, urllib, string
+
+##
+# Installing SSH server
+!apt-get update > /dev/null
+!apt-get install -qq -o=Dpkg::Use-Pty=0 openssh-server > /dev/null
+
+# Installing ngrok
+!wget -nv -nc https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip
+!unzip -n ngrok-stable-linux-amd64.zip
+
+# Creating user accounts
+root_password = secrets.token_urlsafe()
+user_password = secrets.token_urlsafe()
+user_name = "colab"
+!useradd -s /bin/bash -m $user_name
+!echo root:$root_password | chpasswd
+!echo $user_name:$user_password | chpasswd
+!usermod -aG sudo $user_name
+!mkdir -p /run/sshd
+!service ssh restart
+
+# Installing VNC related stuff
+libjpeg_ver = "2.0.4"
+virtualGL_ver = "2.6.3"
+turboVNC_ver = "2.2.5"
+
+libjpeg_url = "https://iweb.dl.sourceforge.net/project/libjpeg-turbo/{0}/libjpeg-turbo-official_{0}_amd64.deb".format(libjpeg_ver)
+virtualGL_url = "https://iweb.dl.sourceforge.net/project/virtualgl/{0}/virtualgl_{0}_amd64.deb".format(virtualGL_ver)
+turboVNC_url = "https://iweb.dl.sourceforge.net/project/turbovnc/{0}/turbovnc_{0}_amd64.deb".format(turboVNC_ver)
+
+!curl -fsSL -O $libjpeg_url
+!curl -fsSL -O $virtualGL_url
+!curl -fsSL -O $turboVNC_url
+!dpkg -i *.deb
+
+# Installing the desktop environment and some additional software
+!add-apt-repository ppa:x2go/stable -y
+!apt-get update
+!apt-get -qq install xfce4 xfce4-terminal xfce4-taskmanager htop leafpad chromium-browser x2goserver x2goserver-xsession > /dev/null
+
+# Setting up TurboVNC
+vnc_sec_conf_p = pathlib.Path("/etc/turbovncserver-security.conf")
+vnc_sec_conf_p.write_text("""\
+no-remote-connections
+no-httpd
+no-x11-tcp-connections
+""")
+
+# Installing Nvidia drivers
+!wget -nv -nc http://us.download.nvidia.com/tesla/410.104/NVIDIA-Linux-x86_64-410.104.run
+!chmod +x NVIDIA-Linux-x86_64-410.104.run
+!echo 1 | ./NVIDIA-Linux-x86_64-410.104.run --no-kernel-module --ui=none
+
+# Make sure GPU is indeed working
+!export LD_PRELOAD=/usr/lib64-nvidia/libnvidia-ml.so
+!nvidia-smi -L
+
+# Creating a headless screen
+!nvidia-xconfig -a --allow-empty-initial-configuration --virtual=1920x1080 --busid PCI:0:4:0
+
+# Edit xorg.conf so that Nvidia driver is loaded on seat-1.
+with open("/etc/X11/xorg.conf", "r") as f:
+  conf = f.read()
+  conf = re.sub('(Section "Device".*?)(EndSection)', '\\1    MatchSeat      "seat-1"\n\\2', conf, 1, re.DOTALL)
+
+with open("/etc/X11/xorg.conf", "w") as f:
+  f.write(conf)
+
+!/opt/VirtualGL/bin/vglserver_config -config +s +f
+
+# Setting up ngrok
+if not pathlib.Path('/root/.ngrok2/ngrok.yml').exists():
+  print("---")
+  print("Copy and paste your tunnel authtoken from https://dashboard.ngrok.com/auth")
+  print("(You need to sign up for ngrok and login)")
+  ngrok_token = getpass.getpass()
+  !./ngrok authtoken $ngrok_token
+
+print("Select your ngrok region:")
+print("us - United States (Ohio)")
+print("eu - Europe (Frankfurt)")
+print("ap - Asia/Pacific (Singapore)")
+print("au - Australia (Sydney)")
+region = input()
+
+get_ipython().system_raw("./ngrok tcp -region {} 22 &".format(region))
+!sleep 1
+tunnels = !curl -s http://localhost:4040/api/tunnels
+url = json.loads(tunnels[0])["tunnels"][0]["public_url"]
+m = re.match("tcp://(.+):(\d+)", url)
+hostname = m.group(1)
+port = m.group(2)
+ssh_common_options = "-o UserKnownHostsFile=/dev/null -o ServerAliveInterval=60"
+
+# Give the user login credentials etc.
+print("✂️"*24)
+print("root password: {}".format(root_password))
+print("{} password: {}".format(user_name, user_password))
+print("✂️"*24)
+print("---")
+print("Command to connect to the ssh server:")
+print("✂️"*24)
+print("ssh {} -p {} {}@{}".format(ssh_common_options, port, user_name, hostname))
+print("✂️"*24)
+print("---")
+print("If you use X2Go:")
+print("✂️"*24)
+print("ssh {} -L 2222:localhost:22 -p {} {}@{}".format(ssh_common_options, port, user_name, hostname))
+print("✂️"*24)
+print("---")
+print("If you use VNC:")
+print("✂️"*24)
+print("ssh {} -L 5901:localhost:5901 -p {} {}@{}".format(ssh_common_options, port, user_name, hostname))
+print("✂️"*24)
+
+# And finally run the Xorg server
+get_ipython().system_raw("Xorg -seat seat-1 -allowMouseOpenFail -novtswitch -nolisten tcp &")
+
+vncrun_py = pathlib.Path("vncrun.py")
+vncrun_py.write_text("""\
+import subprocess, secrets, pathlib
+
+vnc_passwd = secrets.token_urlsafe()[:8]
+vnc_viewonly_passwd = secrets.token_urlsafe()[:8]
+print("✂️"*24)
+print("VNC password: {}".format(vnc_passwd))
+print("VNC view only password: {}".format(vnc_viewonly_passwd))
+print("✂️"*24)
+vncpasswd_input = "{0}\\n{1}".format(vnc_passwd, vnc_viewonly_passwd)
+vnc_user_dir = pathlib.Path.home().joinpath(".vnc")
+vnc_user_dir.mkdir(exist_ok=True)
+vnc_user_passwd = vnc_user_dir.joinpath("passwd")
+with vnc_user_passwd.open('wb') as f:
+  subprocess.run(
+    ["/opt/TurboVNC/bin/vncpasswd", "-f"],
+    stdout=f,
+    input=vncpasswd_input,
+    universal_newlines=True)
+vnc_user_passwd.chmod(0o600)
+
+subprocess.run(
+  ["/opt/TurboVNC/bin/vncserver"]
+)
+""")
+
+!su -c'python3 vncrun.py' $user_name
